@@ -21,6 +21,8 @@ import 'package:reaprime/src/controllers/steam_sequencer.dart';
 import 'package:reaprime/src/controllers/connection_manager.dart';
 import 'package:reaprime/src/controllers/de1_controller.dart';
 import 'package:reaprime/src/controllers/device_controller.dart';
+import 'package:reaprime/src/controllers/remembered_device_sources.dart';
+import 'package:reaprime/src/controllers/remembered_devices_controller.dart';
 import 'package:reaprime/src/controllers/display_controller.dart';
 import 'package:reaprime/src/controllers/persistence_controller.dart';
 import 'package:reaprime/src/controllers/presence_controller.dart';
@@ -306,6 +308,21 @@ void main() async {
     settingsController: settingsController,
   );
 
+  // Remembers devices the user connects to (machine + scale), shown as
+  // unavailable when absent. The stream mappers (which read {id,name,type} off
+  // the connected device and skip simulated devices) live in
+  // `remembered_device_sources.dart` so they're unit-testable; the controller
+  // itself stays interface-agnostic.
+  final rememberedDevicesController = RememberedDevicesController(
+    machineConnections: de1Controller.de1.map(rememberedFromMachine),
+    scaleConnections: scaleController.connectionState.map(
+      (state) =>
+          rememberedFromScaleState(state, scaleController.connectedScale),
+    ),
+    settings: SharedPreferencesSettingsService(),
+  );
+  await rememberedDevicesController.initialize();
+
   final scanStateGuardian = ScanStateGuardian(
     bleService: bleDiscoveryService,
   );
@@ -430,6 +447,7 @@ void main() async {
       grinderStorage: grinderStorage,
       connectionManager: connectionManager,
       wifiScaleDiscoveryService: wifiScaleDiscoveryService,
+      rememberedDevicesController: rememberedDevicesController,
       decentAccountService: decentAccountService,
       decentProxyService: decentProxyService,
       proxyTokenService: proxyTokenService,

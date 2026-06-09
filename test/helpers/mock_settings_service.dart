@@ -31,6 +31,7 @@ class MockSettingsService extends SettingsService {
   bool _userPresenceEnabled = true;
   int _sleepTimeoutMinutes = 30;
   String _wakeSchedules = '[]';
+  String _rememberedDevices = '[]';
   bool _lowBatteryBrightnessLimit = false;
   bool _onboardingCompleted = true; // skip onboarding in tests
   bool _accountStepSeen = true; // skip account step in tests
@@ -132,6 +133,23 @@ class MockSettingsService extends SettingsService {
   Future<String> wakeSchedules() async => _wakeSchedules;
   @override
   Future<void> setWakeSchedules(String json) async => _wakeSchedules = json;
+  /// Number of times [setRememberedDevices] has been called — lets tests assert
+  /// that an identical reconnect does not trigger a redundant persist.
+  int rememberedDevicesWriteCount = 0;
+
+  /// When true, [setRememberedDevices] throws — simulates a failed persist
+  /// (disk full / platform-channel error).
+  bool failRememberedDevicesWrite = false;
+  @override
+  Future<String> rememberedDevices() async => _rememberedDevices;
+  @override
+  Future<void> setRememberedDevices(String json) async {
+    rememberedDevicesWriteCount++;
+    if (failRememberedDevicesWrite) {
+      throw StateError('simulated persist failure');
+    }
+    _rememberedDevices = json;
+  }
   @override
   Future<bool> lowBatteryBrightnessLimit() async => _lowBatteryBrightnessLimit;
   @override

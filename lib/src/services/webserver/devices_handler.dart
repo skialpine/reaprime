@@ -8,6 +8,8 @@ class DevicesStateAggregator {
   final DeviceController _controller;
   final BatteryController? _batteryController;
   final ConnectionManager _connectionManager;
+  final RememberedDevicesController? _rememberedController;
+  final String? Function()? _preferredScaleId;
   final Logger _log = Logger("DevicesStateAggregator");
 
   final List<StreamSubscription> _subscriptions = [];
@@ -32,9 +34,13 @@ class DevicesStateAggregator {
     required DeviceController controller,
     BatteryController? batteryController,
     required ConnectionManager connectionManager,
+    RememberedDevicesController? rememberedController,
+    String? Function()? preferredScaleId,
   })  : _controller = controller,
         _batteryController = batteryController,
-        _connectionManager = connectionManager {
+        _connectionManager = connectionManager,
+        _rememberedController = rememberedController,
+        _preferredScaleId = preferredScaleId {
     _start();
   }
 
@@ -62,6 +68,15 @@ class DevicesStateAggregator {
     _subscriptions.add(
       _connectionManager.status.skip(1).listen((_) => _emitState()),
     );
+
+    // Re-emit when the remembered set changes (a device remembered/forgotten),
+    // so available/unavailable entries appear/disappear promptly (skip replay).
+    final remembered = _rememberedController;
+    if (remembered != null) {
+      _subscriptions.add(
+        remembered.changes.skip(1).listen((_) => _emitState()),
+      );
+    }
 
     // Set up initial per-device subscriptions
     _updateDeviceSubscriptions(_controller.devices);
@@ -122,17 +137,11 @@ class DevicesStateAggregator {
   }
 
   Future<Map<String, dynamic>> _buildSnapshot() async {
-    final devices = _controller.devices;
-    final devList = <Map<String, String>>[];
-    for (var device in devices) {
-      var state = await device.connectionState.first;
-      devList.add({
-        'name': device.name,
-        'id': device.deviceId,
-        'state': state.name,
-        'type': device.type.name,
-      });
-    }
+    final devList = await buildAvailabilityDeviceList(
+      _controller.devices,
+      _rememberedController?.remembered ?? const [],
+      preferredScaleId: _preferredScaleId?.call(),
+    );
 
     final snapshot = <String, dynamic>{
       'timestamp': DateTime.now().toUtc().toIso8601String(),
@@ -185,6 +194,8 @@ class DevicesStateAggregator {
 class DevicesHandler {
   final DeviceController _controller;
   final ConnectionManager _connectionManager;
+  final RememberedDevicesController? _rememberedController;
+  final String? Function()? _preferredScaleId;
   final Logger _log = Logger("Devices handler");
   final DevicesStateAggregator _aggregator;
 
@@ -192,12 +203,18 @@ class DevicesHandler {
     required DeviceController controller,
     BatteryController? batteryController,
     required ConnectionManager connectionManager,
+    RememberedDevicesController? rememberedController,
+    String? Function()? preferredScaleId,
   })  : _controller = controller,
         _connectionManager = connectionManager,
+        _rememberedController = rememberedController,
+        _preferredScaleId = preferredScaleId,
         _aggregator = DevicesStateAggregator(
           controller: controller,
           batteryController: batteryController,
           connectionManager: connectionManager,
+          rememberedController: rememberedController,
+          preferredScaleId: preferredScaleId,
         );
 
   void dispose() {
@@ -241,41 +258,65 @@ class DevicesHandler {
     app.put('/api/v1/devices/connect', _handleConnect);
     app.put('/api/v1/devices/disconnect', _handleDisconnect);
 
+    // Forget a remembered device: drop it from the persistent registry. If the
+    // device isn't currently present it then no longer appears in the list.
+    // deviceId comes from the body/query (not the path) since serial ids are
+    // paths like /dev/cu.* and WiFi ids contain ':', neither URL-path-safe.
+    app.put('/api/v1/devices/forget', _handleForget);
+
     app.get(
       '/ws/v1/devices',
       sws.webSocketHandler(_handleDevicesSocket),
     );
   }
 
-  Future<List<Map<String, String>>> _deviceList() async {
-    var devices = _controller.devices;
-    var devMap = <Map<String, String>>[];
-    for (var device in devices) {
-      var state = await device.connectionState.first;
-      devMap.add({
-        'name': device.name,
-        'id': device.deviceId,
-        'state': state.name,
-        'type': device.type.name,
-      });
-    }
-    return devMap;
+  Future<List<Map<String, dynamic>>> _deviceList() async {
+    return buildAvailabilityDeviceList(
+      _controller.devices,
+      _rememberedController?.remembered ?? const [],
+      preferredScaleId: _preferredScaleId?.call(),
+    );
   }
 
   /// Extract deviceId from JSON body or query parameter.
   /// Body takes precedence; query param is kept for backward compatibility.
   Future<String?> _extractDeviceId(Request req) async {
+    String body;
     try {
-      final body = await req.readAsString();
-      if (body.isNotEmpty) {
-        final json = jsonDecode(body) as Map<String, dynamic>;
-        final id = json['deviceId'] as String?;
-        if (id != null) return id;
+      body = await req.readAsString();
+    } catch (e, st) {
+      _log.warning('failed to read request body', e, st);
+      return req.requestedUri.queryParameters['deviceId'];
+    }
+    if (body.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(body);
+        // Tolerate a wrong-shape body (e.g. an array) by falling through to the
+        // query param, rather than letting a cast throw.
+        if (decoded is Map<String, dynamic> && decoded['deviceId'] is String) {
+          return decoded['deviceId'] as String;
+        }
+      } on FormatException {
+        // Not valid JSON — fall through to the query parameter.
       }
-    } catch (_) {
-      // Not valid JSON — fall through to query parameter
     }
     return req.requestedUri.queryParameters['deviceId'];
+  }
+
+  Future<Response> _handleForget(Request req) async {
+    final remembered = _rememberedController;
+    if (remembered == null) {
+      // The feature is wired in normal operation; a null controller means it's
+      // unavailable, not that the server broke — 503, not 500, so it doesn't
+      // pollute error monitoring.
+      return jsonServiceUnavailable({'error': 'remembered devices not available'});
+    }
+    final deviceId = await _extractDeviceId(req);
+    if (deviceId == null) {
+      return jsonBadRequest({'error': 'Missing deviceId'});
+    }
+    await remembered.forget(deviceId);
+    return jsonOk(null);
   }
 
   Future<Response> _handleConnect(Request req) async {
@@ -427,5 +468,92 @@ class DevicesHandler {
         await (device as Sensor).onConnect();
     }
   }
+}
+
+/// One entry in the API device list. `available` (is the device currently
+/// present) is a SEPARATE axis from `state` (a live device can be
+/// discovered-but-disconnected while still available), so it gets its own field.
+/// The two factories make the illegal pairings unrepresentable: a remembered
+/// entry is always unavailable + `disconnected`; a live entry carries its real
+/// state. Both REST and WebSocket surfaces serialize via [toJson], so the wire
+/// shape can't drift between them.
+class DeviceListEntry {
+  final String id;
+  final String name;
+  final DeviceType type;
+  final ConnectionState state;
+  final bool available;
+
+  const DeviceListEntry._({
+    required this.id,
+    required this.name,
+    required this.type,
+    required this.state,
+    required this.available,
+  });
+
+  /// A currently-present device, with its real connection state.
+  DeviceListEntry.live(Device device, ConnectionState state)
+      : this._(
+          id: device.deviceId,
+          name: device.name,
+          type: device.type,
+          state: state,
+          available: true,
+        );
+
+  /// A remembered device that isn't currently present.
+  DeviceListEntry.remembered(RememberedDevice r)
+      : this._(
+          id: r.id,
+          name: r.name,
+          type: r.type,
+          state: ConnectionState.disconnected,
+          available: false,
+        );
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'id': id,
+        'state': state.name,
+        'type': type.name,
+        'available': available,
+      };
+}
+
+/// Builds the API device list: currently-present devices (`available: true`)
+/// merged with remembered devices that aren't present (`available: false`,
+/// reported as `disconnected`). A remembered device that IS present is listed
+/// once, as available. Shared by the REST `_deviceList` and the WebSocket
+/// `_buildSnapshot` so both surfaces agree.
+Future<List<Map<String, dynamic>>> buildAvailabilityDeviceList(
+  List<Device> liveDevices,
+  List<RememberedDevice> remembered, {
+  String? preferredScaleId,
+}) async {
+  final entries = <DeviceListEntry>[];
+  final liveIds = <String>{};
+  for (final device in liveDevices) {
+    final state = await device.connectionState.first;
+    liveIds.add(device.deviceId);
+    entries.add(DeviceListEntry.live(device, state));
+  }
+  for (final r in remembered) {
+    if (liveIds.contains(r.id)) continue;
+    entries.add(DeviceListEntry.remembered(r));
+  }
+  // Stable order: the preferred scale first, then a deterministic order that
+  // does NOT depend on connection state — so entries don't shift around as
+  // devices connect/disconnect (the underlying live list reorders on every
+  // scan/state change). Key by (type, id); both are stable per device.
+  entries.sort((a, b) {
+    final aPref = preferredScaleId != null && a.id == preferredScaleId;
+    final bPref = preferredScaleId != null && b.id == preferredScaleId;
+    if (aPref != bPref) return aPref ? -1 : 1;
+    final byType = a.type.name.compareTo(b.type.name);
+    if (byType != 0) return byType;
+    return a.id.compareTo(b.id);
+  });
+  return entries.map((e) => e.toJson()).toList();
 }
 
