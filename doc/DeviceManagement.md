@@ -106,6 +106,23 @@ Discovery services are responsible for scanning and creating device instances. E
 - **Purpose:** Testing without physical hardware
 - **Activation:** Set `simulate=1` compile-time variable or enable in settings
 
+#### 5. WifiScaleDiscoveryService
+- **Platform:** All (Android, iOS, macOS, Windows, Linux)
+- **Files:**
+  - `lib/src/services/wifi/wifi_scale_discovery_service.dart` (service + `WifiScaleBrowser`/`WifiManualEndpointStore` seams + `WifiScaleEndpoint`)
+  - `lib/src/services/wifi/bonsoir_wifi_scale_browser.dart` (bonsoir-backed mDNS browser + shared_preferences manual store)
+  - `lib/src/services/wifi/wifi_ip_cache.dart` (resolve-once IP cache)
+  - `lib/src/models/device/impl/decent_scale/scale_wifi.dart` (`HDSWifi` scale)
+  - `lib/src/models/device/impl/decent_scale/hds_wifi_protocol.dart` (JSON frame parser + command strings)
+  - `lib/src/models/device/transport/web_socket_transport.dart` (`WebSocketTransport` / `WsTransport`)
+- **Purpose:** Discover and connect the WiFi **Half Decent Scale** (HDS) — the same hardware reachable over BLE (`DecentScale`) and USB (`HDSSerial`), but over WiFi it speaks **JSON over a WebSocket**, not the binary BLE/serial protocol. Motivation: free the BLE radio for the machine, removing scale↔machine BLE contention (helps weak-BT tablets).
+- **Discovery:** DNS-SD (mDNS) via bonsoir — browses `_decentscale._tcp`, resolves the host (`hds.local`) + IPv4, connects to `ws://<ip>:80/snapshot`. Native on every platform (NsdManager / Bonjour / Avahi / dns_sd), so **no app-managed `MulticastLock`** is needed on Android.
+- **Manual fallback:** A host (IP or name) can be added manually (`addManualEndpoint`), persisted via `shared_preferences`, and is always re-emitted on startup for auto-reconnect. This is the universal fallback when discovery is unavailable — e.g. **Linux without the Avahi daemon**, locked-down networks, or any mDNS failure.
+- **Identity:** A WiFi scale is its own device, `deviceId = "wifi:<host>"`, distinct from the BLE/USB identities of the same physical scale (the same scale may appear as up to three entries; the user picks one).
+- **Reliability:** `HDSWifi` owns a connect handshake (`rate 10k` → `events on` → `status`), an **HDS-recognition gate** (not reported `connected` until a `grams`/`status` frame proves the endpoint is a scale), and a **snapshot watchdog** (a silent stall with the socket still open emits `disconnected`). It runs **no reconnect loop of its own** — like the BLE/USB scales, a drop is reported by emitting `disconnected`, and `ConnectionManager`'s preferred-scale reconnect owns re-connection (one reconnect policy for all transports). On reconnect the discovery service rebuilds the transport against the cached IP first (`WifiIpCache`), re-resolving only on failure — honoring the firmware's resolve-once / prefer-IPv4 guidance. Presence in the device list is **reachability-driven**: a discovered scale is probed (TCP connect to `:80`) and hidden after repeated failures, re-surfaced when its IP answers again — so mDNS flakiness can't flicker the list.
+- **Construction:** Like the USB HDS path, the service constructs `HDSWifi` **directly**, bypassing the BLE-coupled `DeviceMatcher`.
+- **Platform config:** iOS/macOS `Info.plist` declare `NSBonjourServices` (`_decentscale._tcp`) + `NSLocalNetworkUsageDescription` (without these, Apple silently returns no results); macOS already grants the `com.apple.security.network.client` entitlement. Linux discovery requires the **Avahi daemon** running; otherwise use manual entry.
+
 ### Device Matching
 
 Discovery services use name-based matching via `DeviceMatcher` to create appropriate device instances from BLE advertisement names:
@@ -942,7 +959,7 @@ _log.info('Found serial ports: $ports');
 
 ### Device Implementations
 - `lib/src/models/device/impl/de1/` - DE1 machines (BLE + Serial, unified interface in `unified_de1/`)
-- `lib/src/models/device/impl/decent_scale/` - Decent Scale (BLE + Serial)
+- `lib/src/models/device/impl/decent_scale/` - Decent Scale (BLE + Serial + WiFi)
 - `lib/src/models/device/impl/acaia/` - Acaia scales (unified: IPS protocol for older ACAIA/PROCH, Pyxis protocol for Lunar/Pearl/Pyxis, auto-detected at connect time)
 - `lib/src/models/device/impl/felicita/` - Felicita Arc scale
 - `lib/src/models/device/impl/bookoo/` - Bookoo Miniscale

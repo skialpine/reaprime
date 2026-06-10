@@ -7,7 +7,11 @@ import 'package:reaprime/src/models/device/scale.dart';
 import 'package:reaprime/src/models/device/transport/serial_port.dart';
 import 'package:rxdart/subjects.dart';
 
-class HDSSerial implements Scale {
+/// Implements [TransportHandoffScale]: a USB disconnect only releases the
+/// serial port (no power-off command), so handing the active-scale role to
+/// another transport of the same physical HDS is non-destructive. Declaring the
+/// capability makes that a compile-checked property.
+class HDSSerial implements Scale, TransportHandoffScale {
   late Logger _log;
   final SerialTransport _transport;
 
@@ -58,7 +62,10 @@ class HDSSerial implements Scale {
   }
 
   @override
-  String get name => "Half Decent Scale";
+  Future<void> disconnectForHandoff() => disconnect();
+
+  @override
+  String get name => "Half Decent Scale (USB)";
 
   StreamSubscription<Uint8List>? _transportSubscription;
   int _totalFrames = 0;
@@ -67,6 +74,9 @@ class HDSSerial implements Scale {
   Future<void> onConnect() async {
     _log.info("on connect (id=$deviceId, transport=${_transport.name})");
     _totalFrames = 0;
+    // Announce `connecting` BEFORE opening the port so the serial reconcile's
+    // liveness pass won't release (dispose) this transport mid-connect.
+    _connectionSubject.add(ConnectionState.connecting);
     await _transport.connect();
     _transportSubscription = _transport.rawStream.listen(
       onData,
